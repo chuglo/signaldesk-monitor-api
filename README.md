@@ -1,5 +1,7 @@
 # SignalDesk Monitor API
 
+**Not for production use.**
+
 Tenant-isolated monitor authority. It owns monitor schedules and lease-fenced monitor runs; it never accesses another service database.
 
 Public routes (service actor `web-bff`) are `POST/GET /v1/monitors`, `GET/PATCH/DELETE /v1/monitors/{id}`, and `POST /v1/monitors/{id}/pause|resume`. Each requires asserted user and organization headers which are re-authorized by Control API.
@@ -12,3 +14,7 @@ Build from this repository with the sibling service kit supplied as a relative a
 `docker build --build-context service-kit=../signaldesk-service-kit .`
 
 Run migrations with `alembic upgrade head`; launch with `signaldesk-monitor-api`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
