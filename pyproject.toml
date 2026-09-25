@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "signaldesk-monitor-api"
+version = "0.1.0"
+description = "Tenant-isolated monitor scheduling authority for SignalDesk."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "alembic>=1.13,<2", "fastapi>=0.116,<0.117", "httpx>=0.27,<1",
+  "psycopg[binary]>=3.2,<4", "pydantic>=2.8,<3", "pydantic-settings>=2.5,<3",
+  "sqlalchemy>=2.0,<3", "uvicorn>=0.30,<1", "signaldesk-service-kit==0.1.0",
+]
+
+[tool.uv.sources]
+signaldesk-service-kit = { path = "../signaldesk-service-kit" }
+
+[dependency-groups]
+dev = ["pytest>=8.3,<9", "pytest-asyncio>=0.24,<1"]
+
+[project.scripts]
+signaldesk-monitor-api = "signaldesk_monitor_api.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/signaldesk_monitor_api"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
