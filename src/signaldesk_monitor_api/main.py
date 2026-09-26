@@ -2,15 +2,15 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import asynccontextmanager
 from uuid import UUID
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 from signaldesk_service_kit import ServiceCredential, ServiceCredentialSet, ServicePrincipal, build_service_auth_dependency
 from .control import ControlClient
 from .database import create_session_factory
 from .models import Monitor
-from .schemas import AttachOut, AttachRequest, ClaimOut, MonitorCreate, MonitorOut, MonitorUpdate, ResolveOut, ResolveRequest
-from .service import attach, claim_due, create_monitor, public_monitor, resolve, set_monitor_state, update_monitor
+from .schemas import AttachOut, AttachRequest, ClaimOut, MonitorActivityOut, MonitorCreate, MonitorOut, MonitorUpdate, ResolveOut, ResolveRequest
+from .service import attach, claim_due, create_monitor, list_activity, public_monitor, resolve, set_monitor_state, update_monitor
 from .settings import Settings
 
 def _credentials(s: Settings) -> ServiceCredentialSet:
@@ -60,7 +60,7 @@ def create_app(*, settings: Settings | None = None, session_factory: sessionmake
         except Exception: raise HTTPException(503, "dependencies unavailable")
     @app.post("/v1/monitors", response_model=MonitorOut, status_code=201)
     def create(request: MonitorCreate, _: ServicePrincipal = public_auth, context: tuple[UUID, UUID] = Depends(membership), session: Session = Depends(db)):
-        try: monitor, created = create_monitor(session, context[1], context[0], request)
+        try: monitor, created = create_monitor(session, context[1], context[0], request, actor_user_id=context[0])
         except ValueError as e: raise HTTPException(409, str(e))
         if not created: return Response(content=_out(monitor).model_dump_json(), media_type="application/json", status_code=200)
         return _out(monitor)
@@ -71,13 +71,17 @@ def create_app(*, settings: Settings | None = None, session_factory: sessionmake
     def get(monitor_id: UUID, _: ServicePrincipal = public_auth, context: tuple[UUID, UUID] = Depends(membership), session: Session = Depends(db)):
         try: return _out(public_monitor(session, monitor_id, context[1]))
         except LookupError: raise HTTPException(404, "monitor not found")
+    @app.get("/v1/monitors/{monitor_id}/activity", response_model=list[MonitorActivityOut])
+    def activity(monitor_id: UUID, limit: int = Query(default=50, ge=1, le=100), before_id: int | None = Query(default=None, ge=1), _: ServicePrincipal = public_auth, context: tuple[UUID, UUID] = Depends(membership), session: Session = Depends(db)):
+        try: return [MonitorActivityOut.model_validate(event, from_attributes=True) for event in list_activity(session, monitor_id, context[1], limit, before_id)]
+        except LookupError: raise HTTPException(404, "monitor not found")
     @app.patch("/v1/monitors/{monitor_id}", response_model=MonitorOut)
     def update(monitor_id: UUID, request: MonitorUpdate, _: ServicePrincipal = public_auth, context: tuple[UUID, UUID] = Depends(membership), session: Session = Depends(db)):
-        try: monitor = update_monitor(session, monitor_id, context[1], request)
+        try: monitor = update_monitor(session, monitor_id, context[1], request, actor_user_id=context[0])
         except LookupError: raise HTTPException(404, "monitor not found")
         return _out(monitor)
     def set_state(monitor_id: UUID, desired: str, context: tuple[UUID, UUID], session: Session) -> MonitorOut:
-        try: m = set_monitor_state(session, monitor_id, context[1], desired)
+        try: m = set_monitor_state(session, monitor_id, context[1], desired, actor_user_id=context[0])
         except LookupError: raise HTTPException(404, "monitor not found")
         return _out(m)
     @app.post("/v1/monitors/{monitor_id}/pause", response_model=MonitorOut)

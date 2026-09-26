@@ -18,17 +18,26 @@ def session():
 def request(key=None):
     return MonitorCreate(name="primary", target="https://example.test/health", cadence_seconds=30, idempotency_key=key or uuid4())
 
+def create_as_creator(session, org, creator, monitor_request):
+    return create_monitor(session, org, creator, monitor_request, actor_user_id=creator)
+
+
+def test_configuration_changes_require_a_human_actor(session):
+    with pytest.raises(TypeError, match="actor_user_id"):
+        create_monitor(session, uuid4(), uuid4(), request())
+
+
 def test_create_idempotency_and_conflict(session):
     org, user, key = uuid4(), uuid4(), uuid4()
-    monitor, created = create_monitor(session, org, user, request(key))
+    monitor, created = create_as_creator(session, org, user, request(key))
     assert created
-    replay, created = create_monitor(session, org, user, request(key))
+    replay, created = create_as_creator(session, org, user, request(key))
     assert replay.id == monitor.id and not created
     with pytest.raises(ValueError, match="conflicts"):
-        create_monitor(session, org, user, MonitorCreate(name="changed", target="https://example.test/health", cadence_seconds=30, idempotency_key=key))
+        create_as_creator(session, org, user, MonitorCreate(name="changed", target="https://example.test/health", cadence_seconds=30, idempotency_key=key))
 
 def test_claim_attach_fences_stale_and_terminal_is_idempotent(session):
-    monitor, _ = create_monitor(session, uuid4(), uuid4(), request())
+    monitor, _ = create_as_creator(session, uuid4(), uuid4(), request())
     claimed = claim_due(session, 120)
     assert claimed is not None
     run, _, token = claimed
@@ -43,7 +52,7 @@ def test_claim_attach_fences_stale_and_terminal_is_idempotent(session):
         resolve(session, diagnostic, monitor.organization_id, "completed")
 
 def test_reclaim_uses_new_generation_and_no_second_slot(session):
-    monitor, _ = create_monitor(session, uuid4(), uuid4(), request())
+    monitor, _ = create_as_creator(session, uuid4(), uuid4(), request())
     first = claim_due(session, 1)
     assert first is not None
     run, _, old_token = first
@@ -56,7 +65,7 @@ def test_reclaim_uses_new_generation_and_no_second_slot(session):
 
 
 def test_attached_run_blocks_new_slot_and_replay_survives_expiry(session):
-    monitor, _ = create_monitor(session, uuid4(), uuid4(), request())
+    monitor, _ = create_as_creator(session, uuid4(), uuid4(), request())
     run, _, token = claim_due(session, 1)
     diagnostic = uuid4()
     attach(session, run.id, diagnostic, token, run.lease_generation)

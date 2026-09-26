@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from .models import Monitor, MonitorRun
+from .models import Monitor, MonitorActivity, MonitorRun
 from .schemas import MonitorCreate, MonitorUpdate
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -35,7 +35,20 @@ def public_monitor(session: Session, monitor_id: UUID, org: UUID, *, lock: bool 
     if not monitor: raise LookupError("monitor not found")
     return monitor
 
-def create_monitor(session: Session, org: UUID, creator: UUID, request: MonitorCreate) -> tuple[Monitor, bool]:
+def record_activity(session: Session, monitor: Monitor, actor_user_id: UUID, action: str, fields: list[str]) -> None:
+    session.add(MonitorActivity(organization_id=monitor.organization_id, monitor_id=monitor.id,
+                                actor_user_id=actor_user_id, action=action, changed_fields=fields))
+
+def list_activity(session: Session, monitor_id: UUID, org: UUID, limit: int, before_id: int | None) -> list[MonitorActivity]:
+    # Include soft-deleted monitors so their final transition remains available to the tenant.
+    if session.scalar(select(Monitor.id).where(Monitor.id == monitor_id, Monitor.organization_id == org)) is None:
+        raise LookupError("monitor not found")
+    statement = select(MonitorActivity).where(MonitorActivity.monitor_id == monitor_id, MonitorActivity.organization_id == org)
+    if before_id is not None:
+        statement = statement.where(MonitorActivity.id < before_id)
+    return list(session.scalars(statement.order_by(MonitorActivity.id.desc()).limit(limit)))
+
+def create_monitor(session: Session, org: UUID, creator: UUID, request: MonitorCreate, *, actor_user_id: UUID) -> tuple[Monitor, bool]:
     existing = session.scalar(select(Monitor).where(Monitor.organization_id == org, Monitor.creator_id == creator, Monitor.idempotency_key == request.idempotency_key))
     digest = fingerprint(request)
     if existing:
@@ -51,6 +64,7 @@ def create_monitor(session: Session, org: UUID, creator: UUID, request: MonitorC
         if existing is None: raise
         if existing.request_fingerprint != digest: raise ValueError("idempotency key conflicts with prior request")
         return existing, False
+    record_activity(session, monitor, actor_user_id, "created", [])
     return monitor, True
 
 def claim_due(session: Session, lease_seconds: int) -> tuple[MonitorRun, Monitor, str] | None:
@@ -90,22 +104,29 @@ def attach(session: Session, run_id: UUID, diagnostic_id: UUID, token: str, gene
     run.diagnostic_job_id, run.state, run.lease_token_hash, run.lease_expires_at = diagnostic_id, "diagnostic_attached", None, None
     session.flush(); return run
 
-def update_monitor(session: Session, monitor_id: UUID, org: UUID, request: MonitorUpdate) -> Monitor:
+def update_monitor(session: Session, monitor_id: UUID, org: UUID, request: MonitorUpdate, *, actor_user_id: UUID) -> Monitor:
     monitor = public_monitor(session, monitor_id, org, lock=True)
     values = request.model_dump(exclude_none=True)
-    if "name" in values: monitor.name = values["name"]
-    if "target" in values: monitor.target = str(values["target"])
-    if "alert_on_failure" in values: monitor.alert_on_failure = values["alert_on_failure"]
-    if "cadence_seconds" in values:
+    changed = sorted(key for key, value in values.items() if getattr(monitor, key) != (str(value) if key == "target" else value))
+    if not changed:
+        return monitor
+    if "name" in changed: monitor.name = values["name"]
+    if "target" in changed: monitor.target = str(values["target"])
+    if "alert_on_failure" in changed: monitor.alert_on_failure = values["alert_on_failure"]
+    if "cadence_seconds" in changed:
         monitor.cadence_seconds = values["cadence_seconds"]
         monitor.next_run_at = database_now(session) + timedelta(seconds=monitor.cadence_seconds)
+    record_activity(session, monitor, actor_user_id, "updated", changed)
     session.flush()
     return monitor
 
-def set_monitor_state(session: Session, monitor_id: UUID, org: UUID, desired: str) -> Monitor:
+def set_monitor_state(session: Session, monitor_id: UUID, org: UUID, desired: str, *, actor_user_id: UUID) -> Monitor:
     monitor = public_monitor(session, monitor_id, org, lock=True)
+    if monitor.state == desired:
+        return monitor
     monitor.state = desired
     if desired == "enabled": monitor.next_run_at = database_now(session)
+    record_activity(session, monitor, actor_user_id, {"enabled": "resumed", "paused": "paused", "deleted": "deleted"}[desired], [])
     session.flush()
     return monitor
 

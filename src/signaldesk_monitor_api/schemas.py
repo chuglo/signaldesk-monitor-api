@@ -28,6 +28,11 @@ class MonitorUpdate(Strict):
         return v.strip() if v is not None else v
 class MonitorOut(Strict):
     id: UUID; organization_id: UUID; creator_id: UUID; name: str; target: str; cadence_seconds: int; state: str; alert_on_failure: bool; next_run_at: datetime
+class MonitorActivityOut(Strict):
+    id: int; organization_id: UUID; monitor_id: UUID; actor_user_id: UUID
+    action: Literal["created", "updated", "paused", "resumed", "deleted"]
+    changed_fields: list[str]; created_at: datetime
+
 class ClaimOut(Strict):
     run_id: UUID; monitor_id: UUID; organization_id: UUID; creator_id: UUID; target: str; scheduled_for: datetime; lease_token: str; lease_generation: int; lease_expires_at: datetime
 class AttachRequest(Strict): diagnostic_job_id: UUID = Field(strict=False); lease_token: str = Field(min_length=16); lease_generation: int = Field(ge=1)

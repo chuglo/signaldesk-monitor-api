@@ -14,9 +14,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from signaldesk_monitor_api.models import MonitorRun
+from signaldesk_monitor_api.models import MonitorActivity, MonitorRun
 from signaldesk_monitor_api.schemas import MonitorCreate, MonitorUpdate
 from signaldesk_monitor_api.service import claim_due, create_monitor, set_monitor_state, update_monitor
+
+def _create_as_creator(session, org, creator, request):
+    return create_monitor(session, org, creator, request, actor_user_id=creator)
+
 
 POSTGRES_IMAGE = "postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 ROOT = Path(__file__).parents[1]
@@ -98,9 +102,9 @@ def test_migration_constraints_and_serialized_claim(postgres_url: str) -> None:
     factory = sessionmaker(engine, expire_on_commit=False)
     try:
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "20260825_0001"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "20260926_0002"
         with factory.begin() as session:
-            monitor, _ = create_monitor(session, uuid4(), uuid4(), MonitorCreate(name="postgres", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
+            monitor, _ = _create_as_creator(session, uuid4(), uuid4(), MonitorCreate(name="postgres", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
             monitor_id = monitor.id
         with factory.begin() as first:
             claimed = claim_due(first, 120)
@@ -119,6 +123,39 @@ def test_migration_constraints_and_serialized_claim(postgres_url: str) -> None:
         engine.dispose()
 
 
+def test_activity_migration_is_atomic_with_monitor_updates(postgres_url: str) -> None:
+    engine = create_engine(postgres_url)
+    factory = sessionmaker(engine, expire_on_commit=False)
+    org, user = uuid4(), uuid4()
+    try:
+        with factory.begin() as session:
+            monitor, _ = create_monitor(session, org, user, MonitorCreate(name="audit", target="https://example.test/path?secret=value", cadence_seconds=30, idempotency_key=uuid4()), actor_user_id=user)
+            monitor_id = monitor.id
+        with factory() as session:
+            activity = session.query(MonitorActivity).filter_by(monitor_id=monitor_id).all()
+            assert len(activity) == 1 and activity[0].action == "created"
+            assert activity[0].actor_user_id == user
+            assert "secret" not in str(activity[0].changed_fields)
+        with pytest.raises(RuntimeError):
+            with factory.begin() as session:
+                update_monitor(session, monitor_id, org, MonitorUpdate(name="rolled back"), actor_user_id=user)
+                raise RuntimeError("rollback")
+        with factory() as session:
+            assert session.query(MonitorActivity).filter_by(monitor_id=monitor_id).count() == 1
+            assert session.execute(text("SELECT name FROM monitors WHERE id = :id"), {"id": monitor_id}).scalar() == "audit"
+        with factory.begin() as session:
+            update_monitor(session, monitor_id, org, MonitorUpdate(target="https://example.test/changed?secret=other"), actor_user_id=user)
+        with factory() as session:
+            events = session.query(MonitorActivity).filter_by(monitor_id=monitor_id).order_by(MonitorActivity.id).all()
+            assert [event.action for event in events] == ["created", "updated"]
+            assert events[-1].changed_fields == ["target"]
+            assert "secret" not in str(events[-1].changed_fields)
+        with factory.begin() as session:
+            set_monitor_state(session, monitor_id, org, "deleted", actor_user_id=user)
+    finally:
+        engine.dispose()
+
+
 def test_postgres_skip_locked_allows_only_one_concurrent_claim(postgres_url: str) -> None:
     """A held claim lock makes the second scheduler return without blocking."""
     engine = create_engine(postgres_url)
@@ -129,7 +166,7 @@ def test_postgres_skip_locked_allows_only_one_concurrent_claim(postgres_url: str
     results: list[object] = []
     try:
         with factory.begin() as session:
-            monitor, _ = create_monitor(session, uuid4(), uuid4(), MonitorCreate(name="concurrent", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
+            monitor, _ = _create_as_creator(session, uuid4(), uuid4(), MonitorCreate(name="concurrent", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
             monitor_id = monitor.id
 
         def first_worker() -> None:
@@ -171,16 +208,16 @@ def test_scheduling_uses_postgres_clock_despite_api_skew(postgres_url: str, monk
         with factory.begin() as session:
             database_before = session.scalar(text("SELECT now()"))
             assert database_before is not None
-            monitor, _ = create_monitor(session, uuid4(), uuid4(), MonitorCreate(name="clock", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
+            monitor, _ = _create_as_creator(session, uuid4(), uuid4(), MonitorCreate(name="clock", target="https://example.test/health", cadence_seconds=30, idempotency_key=uuid4()))
             assert abs(monitor.next_run_at - database_before) < timedelta(seconds=2)
             monitor_id, organization_id = monitor.id, monitor.organization_id
         with factory.begin() as session:
-            updated = update_monitor(session, monitor_id, organization_id, MonitorUpdate(cadence_seconds=90))
+            updated = update_monitor(session, monitor_id, organization_id, MonitorUpdate(cadence_seconds=90), actor_user_id=monitor.creator_id)
             database_now = session.scalar(text("SELECT now()"))
             assert database_now is not None
             assert abs(updated.next_run_at - (database_now + timedelta(seconds=90))) < timedelta(seconds=2)
-            set_monitor_state(session, monitor_id, organization_id, "paused")
-            enabled = set_monitor_state(session, monitor_id, organization_id, "enabled")
+            set_monitor_state(session, monitor_id, organization_id, "paused", actor_user_id=monitor.creator_id)
+            enabled = set_monitor_state(session, monitor_id, organization_id, "enabled", actor_user_id=monitor.creator_id)
             database_now = session.scalar(text("SELECT now()"))
             assert database_now is not None
             assert abs(enabled.next_run_at - database_now) < timedelta(seconds=2)

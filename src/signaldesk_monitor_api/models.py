@@ -1,7 +1,7 @@
 from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, Uuid, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -21,6 +21,20 @@ class Monitor(Base):
     next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class MonitorActivity(Base):
+    __tablename__ = "monitor_activity"
+    __table_args__ = (
+        CheckConstraint("action IN ('created', 'updated', 'paused', 'resumed', 'deleted')", name="ck_monitor_activity_action"),
+        Index("ix_monitor_activity_org_monitor_id", "organization_id", "monitor_id", "id"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    organization_id: Mapped[UUID] = mapped_column(Uuid)
+    monitor_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("monitors.id", ondelete="RESTRICT"))
+    actor_user_id: Mapped[UUID] = mapped_column(Uuid)
+    action: Mapped[str] = mapped_column(String(16))
+    changed_fields: Mapped[list[str]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class MonitorRun(Base):
     __tablename__ = "monitor_runs"

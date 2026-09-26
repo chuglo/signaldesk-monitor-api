@@ -56,6 +56,39 @@ def test_public_crud_idempotency_isolation_and_validation() -> None:
     assert client.patch(f"/v1/monitors/{monitor_id}", headers=headers(user_a, org_a), json={"name": "   "}).status_code == 422
 
 
+def test_monitor_activity_is_tenant_scoped_paginated_and_redacted() -> None:
+    client, user_a, org_a, user_b, org_b = configured_app()
+    url = "https://example.test/health?token=do-not-log"
+    key = uuid4()
+    created = client.post("/v1/monitors", headers=headers(user_a, org_a), json=body(key, target=url))
+    assert created.status_code == 201
+    monitor_id = created.json()["id"]
+    assert client.post("/v1/monitors", headers=headers(user_a, org_a), json=body(key, target=url)).status_code == 200
+    assert client.patch(f"/v1/monitors/{monitor_id}", headers=headers(user_a, org_a), json={"name": "changed", "target": url}).status_code == 200
+    assert client.patch(f"/v1/monitors/{monitor_id}", headers=headers(user_a, org_a), json={"name": "changed"}).status_code == 200
+    assert client.post(f"/v1/monitors/{monitor_id}/pause", headers=headers(user_a, org_a)).status_code == 200
+    assert client.post(f"/v1/monitors/{monitor_id}/pause", headers=headers(user_a, org_a)).status_code == 200
+    assert client.post(f"/v1/monitors/{monitor_id}/resume", headers=headers(user_a, org_a)).status_code == 200
+    assert client.delete(f"/v1/monitors/{monitor_id}", headers=headers(user_a, org_a)).status_code == 204
+
+    route = f"/v1/monitors/{monitor_id}/activity"
+    first = client.get(route + "?limit=2", headers=headers(user_a, org_a))
+    assert first.status_code == 200, first.text
+    denied = client.get(route, headers=headers(user_b, org_b))
+    assert denied.status_code == 404
+    assert client.get(route, headers=headers(uuid4(), org_a)).status_code == 403
+    assert client.get(route, headers=headers(user_a, org_a, actor="monitor-scheduler-worker", credential="b" * 32)).status_code == 403
+    assert client.get(route + "?limit=101", headers=headers(user_a, org_a)).status_code == 422
+    assert [event["action"] for event in first.json()] == ["deleted", "resumed"]
+    assert all(event["actor_user_id"] == str(user_a) and event["organization_id"] == str(org_a) for event in first.json())
+    assert "do-not-log" not in first.text
+    older = client.get(route + f"?limit=10&before_id={first.json()[-1]['id']}", headers=headers(user_a, org_a))
+    assert [event["action"] for event in older.json()] == ["paused", "updated", "created"]
+    assert older.json()[1]["changed_fields"] == ["name"]
+    assert "do-not-log" not in older.text
+    assert client.get(route + "?before_id=0", headers=headers(user_a, org_a)).status_code == 422
+
+
 def test_public_auth_membership_and_headers_are_exact_and_sanitized() -> None:
     client, user_a, org_a, _, _ = configured_app()
     assert client.get("/v1/monitors", headers=headers(user_a, org_a, actor="monitor-scheduler-worker", credential="b" * 32)).status_code == 403
